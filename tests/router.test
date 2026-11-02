@@ -1,9 +1,9 @@
 package require tcltest 2
-package require tpathexp 1.0.0
+package require -exact tpathexp 1.1.0
 namespace import ::tcltest::test
 
 proc echoRoute {label request context params} {
-    tpathexp::response 200 [list $label [dict get $request method] $params $context]
+    dict create statusCode 200 body [list $label [dict get $request method] $params $context]
 }
 
 test router-1.1 {first matching method and path wins} -setup {
@@ -60,13 +60,13 @@ test router-1.6 {invalid routes do not alter the existing table} -setup {
         [dict get [$r match GET /ok] statusCode]
 } -cleanup {$r destroy} -result {1 1 1 1 200}
 
-test router-1.7 {router teardown releases matchers} -body {
-    set before [lsort [info commands ::tpathexp::matcher*]]
+test router-1.7 {router teardown releases its native command} -body {
+    set before [lsort [info commands {::tpathexp::router[0-9]*}]]
     set r [tpathexp::router]
     $r add GET /:one echoRoute
     $r add POST /:two echoRoute
     $r destroy
-    expr {$before eq [lsort [info commands ::tpathexp::matcher*]]}
+    expr {$before eq [lsort [info commands {::tpathexp::router[0-9]*}]]}
 } -result 1
 
 test router-2.1 {handler errors propagate with their error codes} -setup {
@@ -124,7 +124,7 @@ test lambda-1.2 {v1 and REST API event shapes} -setup {
 
 test lambda-1.3 {request fields and original event are preserved} -setup {
     proc inspectEvent {request context params} {
-        tpathexp::response 200 [list [dict get $request body] [dict get $request isBase64Encoded] \
+        dict create statusCode 200 body [list [dict get $request body] [dict get $request isBase64Encoded] \
             [dict get $request cookies] [dict get $request event custom] [dict get $request pathParameters]]
     }
     set r [tpathexp::router]
@@ -142,4 +142,87 @@ test lambda-1.4 {malformed and unsupported events are errors} -setup {
 } -cleanup {$r destroy} -result {1 1 1}
 
 rename echoRoute {}
+
+test native-1 {routing is native and response helper is not exported} -body {
+    list [info procs ::tpathexp::*] [info commands ::tpathexp::Router] [info commands ::tpathexp::response]
+} -result {{} {} {}}
+
+test native-2 {handler can destroy the current router} -setup {
+    set r [tpathexp::router]
+    proc deleteCurrent {router request context params} {
+        $router destroy
+        dict create statusCode 200 body [dict get $params id]
+    }
+    $r add GET /:id [list deleteCurrent $r]
+} -body {
+    list [dict get [$r dispatch {method GET path /42}] body] [info commands $r]
+} -cleanup {rename deleteCurrent {}} -result {42 {}}
+
+test native-3 {recursive dispatch uses separate match results} -setup {
+    set r [tpathexp::router]
+    proc recursiveHandler {router request context params} {
+        if {[dict get $params id] eq "outer"} {
+            set inner [$router dispatch {method GET path /inner}]
+            return [dict create statusCode 200 body [list [dict get $inner body] [dict get $params id]]]
+        }
+        dict create statusCode 200 body [dict get $params id]
+    }
+    $r add GET /:id [list recursiveHandler $r]
+} -body {
+    dict get [$r dispatch {method GET path /outer}] body
+} -cleanup {$r destroy; rename recursiveHandler {}} -result {inner outer}
+
+test native-4 {handler command prefixes preserve literal arguments} -setup {
+    set r [tpathexp::router]
+    set marker {a;[error injected] $variable}
+    proc literalHandler {marker request context params} {
+        dict create statusCode 200 body [list $marker $context $params]
+    }
+    $r add GET /:id [list literalHandler $marker]
+} -body {
+    expr {[dict get [$r dispatch {method GET path /ok} $marker] body] eq [list $marker $marker {id ok}]}
+} -cleanup {$r destroy; rename literalHandler {}} -result 1
+
+test native-5 {HEAD normalization does not mutate a shared response} -setup {
+    set r [tpathexp::router]
+    set ::sharedResponse {statusCode 200 body original}
+    proc sharedHandler {args} {return $::sharedResponse}
+    $r add GET / sharedHandler
+} -body {
+    list [dict get [$r dispatch {method HEAD path /}] body] $::sharedResponse
+} -cleanup {$r destroy; rename sharedHandler {}; unset ::sharedResponse} -result {{} {statusCode 200 body original}}
+
+test native-6 {renaming and deleting a router preserve command ownership} -body {
+    set r [tpathexp::router]
+    rename $r ::renamedRouter
+    set name [::renamedRouter add GET / unused]
+    set status [dict get [::renamedRouter match GET /] statusCode]
+    ::renamedRouter destroy
+    list $name $status [info commands ::renamedRouter]
+} -result {::renamedRouter 200 {}}
+
+test native-7 {invalid arguments and NUL input are errors} -setup {
+    set r [tpathexp::router]
+    $r add GET / unused
+} -body {
+    set result {}
+    foreach command [list [list $r] [list $r unknown] [list $r match GET] \
+        [list $r dispatch] [list $r lambda] [list $r add GET /] \
+        [list $r match "GET\0" /] [list $r match GET "/\0"] \
+        [list $r add GET "/\0" unused] [list $r destroy extra]] {
+        lappend result [catch $command]
+    }
+    set result
+} -cleanup {$r destroy} -result {1 1 1 1 1 1 1 1 1 1}
+
+test native-8 {interpreter teardown releases live native tables and handlers} -body {
+    for {set i 0} {$i < 25} {incr i} {
+        interp create child
+        child eval [list set auto_path $auto_path]
+        child eval {package require tpathexp; set r [tpathexp::router]; $r add GET /:id [list unused {long prefix}]}
+        interp delete child
+    }
+    return ok
+} -result ok
+
 ::tcltest::cleanupTests

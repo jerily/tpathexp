@@ -7,15 +7,16 @@ required by the package.
 
 The native matcher adapts a small plain C path-to-regexp compiler. It retains its
 POSIX regular expression engine and path syntax, replaces trie extraction with
-Tcl dictionaries, and records capture indexes for nested custom patterns. A Tcl
-route table supplies ordered method dispatch without native HTTP request or
-response structures.
+Tcl dictionaries, and records capture indexes for nested custom patterns. A C
+route table supplies ordered method dispatch and is shared by the public
+C API and the Tcl commands. The package has no TclOO classes or Tcl implementation
+files; the package index loads the native extension directly.
 
 ## Build and install
 
 Requirements: a POSIX platform with `regex.h`, a C11 compiler, CMake 3.16 or later,
-and Tcl 8.6 or 9.x development files (including its stub library). The selected
-Tcl interpreter must include TclOO; tests also use its bundled `tcltest` package.
+and Tcl 8.6 or 9.x development files. Shared builds use Tcl stubs; the test suite
+uses the bundled `tcltest` package.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -40,17 +41,33 @@ cmake -S . -B build86 \
 
 Use paths appropriate to your system. `CMAKE_PREFIX_PATH` can select a custom Tcl
 installation. The Makefile also supplies `all`, `test`, `install`, and `clean`
-targets, with `CMAKE`, `BUILD_DIR`, and `PREFIX` overrides.
+targets, with `CMAKE`, `BUILD_DIR`, `PREFIX`, and `BUILD_SHARED_LIBS` overrides.
 
-Installation creates `lib/tpathexp1.0.0/` containing the shared library, package
-index, and Tcl module, plus `lib/libtpathexp.a` and `include/tpathexp/` for embedded
-builds. `CMAKE_INSTALL_LIBDIR` can change `lib`. Add the package directory or its
-parent to Tcl's `auto_path` or `TCLLIBPATH` if it is outside the normal search path.
+`BUILD_SHARED_LIBS=ON` is the default and builds only the loadable module.
+Installation creates `lib/tpathexp1.1.0/` containing the shared library and package
+index, plus public headers in `include/tpathexp/`. `CMAKE_INSTALL_LIBDIR` can change
+`lib`. Add the package directory or its parent to Tcl's `auto_path` or `TCLLIBPATH`
+if it is outside the normal search path.
+
+For a static archive, use a separate build directory:
+
+```sh
+cmake -S . -B build-static -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-static
+ctest --test-dir build-static --output-on-failure
+cmake --install build-static --prefix /your/install/prefix
+```
+
+This installs only `lib/libtpathexp.a`, the headers, and a package index that loads
+a statically registered package. It does not build or install a shared module.
+A host interpreter must register the static package before `package require` can
+load it; a regular `tclsh` cannot load the archive. Use fresh install prefixes when
+switching modes, since CMake does not remove files from earlier installations.
 
 ## Compile once, match many times
 
 ```tcl
-package require tpathexp 1.0.0
+package require tpathexp 1.1.0
 
 set matcher [tpathexp::compile {/users/:id([0-9]+)}]
 if {[$matcher match /users/42 params]} {
@@ -117,8 +134,8 @@ use the process locale.
 
 ```tcl
 proc get_user {request context params} {
-    tpathexp::response 200 "User [dict get $params id]\n" \
-        [dict create content-type {text/plain; charset=utf-8}]
+    dict create statusCode 200 body "User [dict get $params id]\n" \
+        headers [dict create content-type {text/plain; charset=utf-8}]
 }
 
 set router [tpathexp::router]
@@ -151,7 +168,8 @@ names for namespace commands. The request includes freshly matched
 Handlers return a response dictionary containing `statusCode` (100–599) and
 `body`. Optional `headers` defaults to an empty dictionary, and
 `isBase64Encoded` defaults to `false`. Other fields pass through unchanged.
-`tpathexp::response status body ?headers?` constructs this dictionary.
+Handlers construct ordinary dictionaries. The Lambda example defines its own
+`::example::response` helper; response construction is not a package command.
 Dispatch generates text 404/405 responses, includes `Allow` on 405, and empties
 all HEAD response bodies. Application errors propagate as Tcl errors, retaining
 their error codes. Use Tcl command prefixes to compose authentication, logging,
@@ -201,23 +219,92 @@ artifact or layer, and put that directory on `auto_path`. For example:
 cmake --install build --prefix "$PWD/stage"
 ```
 
-Include `stage/lib/tpathexp1.0.0` (or the configured library directory) in the
+Include `stage/lib/tpathexp1.1.0` (or the configured library directory) in the
 artifact. Configure the runtime's actual Tcl package path to that location.
 The loadable module uses Tcl stubs and needs no direct `libtcl` dependency.
 
-For a runtime embedding Tcl in C or C++, link `libtpathexp.a` and Tcl, call
-`Tcl_Init(interp)` then `Tpathexp_Init(interp)`, and source the installed
-`tpathexp.tcl` once. The initializer provides `tpathexp::native`; the Tcl file
-provides the complete `tpathexp` package. See [tests/embed.c](tests/embed.c) for a
-working embedding example. Cross builds can set `BUILD_TESTING=OFF` and supply
-the target Tcl include/library paths explicitly.
+For a runtime embedding Tcl in C or C++, build with `BUILD_SHARED_LIBS=OFF` and
+link `libtpathexp.a` plus Tcl and any system libraries required by that Tcl build.
+Register the package once with
+`Tcl_StaticPackage(NULL, "Tpathexp", Tpathexp_Init, NULL)`, then initialize each
+interpreter with `Tcl_Init`. With the installed package index on `auto_path`,
+`package require tpathexp 1.1.0` loads the registered package, including in child
+interpreters. Alternatively, call `Tpathexp_Init(interp)` directly in each
+initialized interpreter. No Tcl implementation file needs to be sourced.
+See [tests/embed.c](tests/embed.c) for a working embedding example. Cross builds
+can set `BUILD_TESTING=OFF` and supply target Tcl include/library paths explicitly.
+
+## Native C route table
+
+Include `router.h` to use routing without a Tcl interpreter. A route definition
+contains an expression, a method bit mask, compilation flags, and caller-owned
+`user_data`. [examples/router.c](examples/router.c) is a complete executable.
+
+```c
+tpathexp_route_t routes[] = {
+    {"/users/:id([0-9]+)", TPATHEXP_GET, TPATHEXP_DEFAULT_FLAGS, NULL},
+    {"/files/:path(.*)", TPATHEXP_GET, TPATHEXP_DEFAULT_FLAGS, NULL}
+};
+tpathexp_router_t *router = NULL;
+char error[512] = {0};
+if (tpathexp_router_create(&router, routes, 2, error, sizeof(error)) != 0) {
+    /* Report error and stop initialization. */
+    return 1;
+}
+tpathexp_match_t match = {0};
+int rc = tpathexp_router_match(router, "GET", "/users/42", &match, error, sizeof(error));
+if (rc == 0 && match.status_code == 200) {
+    const char *id = tpathexp_match_param(&match, "id");
+    /* Use id and match.user_data to invoke application logic here. */
+    (void)id;
+}
+tpathexp_match_destroy(&match);
+tpathexp_router_destroy(router);
+```
+
+`create`, `add`, and `match` return `0` on success and `-1` on an operational or
+input error, writing the error buffer when supplied. `create` leaves its output
+NULL on failure. `add` compiles and appends one route; a failed addition preserves
+existing routes. `TPATHEXP_DEFAULT_FLAGS` enables full-path matching with an
+optional trailing slash; combine it with the `PATH_REGEXP_*` flags as needed.
+
+The match status is `200`, `404`, or `405`. GET also accepts HEAD. Explicit HEAD
+routes take precedence when registered first. `allowed_methods` contains the
+union of methods across matching paths for a 405; use `tpathexp_allow_header` to
+format it into a caller-supplied buffer. Headers use canonical method order:
+GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE, CONNECT. A successful match
+returns the first matching route and its named parameters. An unknown request
+method yields 405 for a known path, or 404 otherwise.
+
+Route expressions and patterns are owned by the table. `user_data` is borrowed
+and never freed by the library. Match results own their parameter values and
+borrow parameter names, the expression, and `user_data`. Call
+`tpathexp_match_destroy` before reusing a result and before destroying the table;
+it is also safe on a zeroed result or after a failed match. Optional unmatched
+parameters are absent, while participating empty captures are empty strings.
+An immutable table can be shared by concurrent callers using separate results;
+route additions and destruction require exclusive access.
+
+The C API selects routes and extracts parameters. Application code invokes its
+handlers and constructs responses. It has no dependency on Tcl response formats.
+A C-only program can link the static archive without Tcl: the linker pulls only
+the native route-table and pattern objects. For example, after a static install:
+
+```sh
+cc -I/your/install/prefix/include/tpathexp examples/router.c \
+  /your/install/prefix/lib/libtpathexp.a -o router-example
+./router-example
+```
 
 ## Tests and limits
 
 Tests cover route ordering, custom/nested captures, character classes, malformed
 expressions, optional captures, Unicode values, NUL rejection, command deletion,
 interpreter teardown, 404/405/HEAD handling, Lambda payload shapes, and warm
-invocation reuse. CTest also executes a statically linked embedding program.
+invocation reuse. Both build modes run the same Tcl tests. Static mode runs them
+through an embedding executable, including child-interpreter package loading.
+CTest also exercises the C route-table API, the C example, and the installed
+artifact layout so the selected mode cannot silently install both library types.
 
 Route lookup scans the table in registration order. Patterns are application
 configuration; do not compile untrusted per-request expressions. Request size
