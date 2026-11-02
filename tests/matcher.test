@@ -1,5 +1,5 @@
 package require tcltest 2
-package require tpathexp 1.0.0
+package require -exact tpathexp 1.1.0
 namespace import ::tcltest::test
 
 proc matchOnce {expression path args} {
