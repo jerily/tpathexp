@@ -1,0 +1,3 @@
+if {![package vsatisfies [package provide Tcl] @TPATHEXP_TCL_REQUIREMENT@]} { return }
+package ifneeded tpathexp::native @PROJECT_VERSION@ [list load [file join $dir @CMAKE_SHARED_LIBRARY_PREFIX@tpathexp@CMAKE_SHARED_LIBRARY_SUFFIX@] Tpathexp]
+package ifneeded tpathexp @PROJECT_VERSION@ [list source [file join $dir tpathexp.tcl]]

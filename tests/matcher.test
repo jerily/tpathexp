@@ -1,0 +1,173 @@
+package require tcltest 2
+package require tpathexp 1.0.0
+namespace import ::tcltest::test
+
+proc matchOnce {expression path args} {
+    set matcher [tpathexp::compile {*}$args -- $expression]
+    try { list [$matcher match $path params] $params } finally { $matcher destroy }
+}
+
+test matcher-1.1 {named parameters and capture ordering} -body {
+    matchOnce /users/:id/orders/:order /users/42/orders/A
+} -result {1 {id 42 order A}}
+
+test matcher-1.2 {custom ERE} -body {
+    list [matchOnce {/users/:id([0-9]+)} /users/42] [matchOnce {/users/:id([0-9]+)} /users/no]
+} -result {{1 {id 42}} {0 {}}}
+
+test matcher-1.3 {nested captures do not shift subsequent parameter names} -body {
+    matchOnce {/:first((ab|cd)+)/:second([0-9]+)/:last} /abcd/123/end
+} -result {1 {first abcd second 123 last end}}
+
+test matcher-1.4 {parentheses in bracket expressions are not groups} -body {
+    matchOnce {/:first([()]+)/:second} /()/tail
+} -result {1 {first () second tail}}
+
+test matcher-1.5 {bracket expression with a leading closing bracket} -body {
+    matchOnce {/:first([])]+)/:second} /])]/tail
+} -result {1 {first \])\] second tail}}
+
+test matcher-1.6 {POSIX bracket class and parentheses} -body {
+    matchOnce {/:first([[:alpha:]()]+)/:second} /a(b)/tail
+} -result {1 {first a(b) second tail}}
+
+test matcher-1.7 {optional parameters are omitted from the dict} -body {
+    list [matchOnce {/users/:id?} /users/] [matchOnce {/users/:id?} /users]
+} -result {{1 {}} {0 {}}}
+
+test matcher-1.8 {empty captures are present} -body {
+    matchOnce {/:name(.*)} /
+} -result {1 {name {}}}
+
+test matcher-1.9 {no match clears stale parameters} -body {
+    set m [tpathexp::compile /:id]
+    set params {stale value}
+    set result [list [$m match /a/b params] $params]
+    $m destroy
+    set result
+} -result {0 {}}
+
+test matcher-2.1 {trailing slash is optional unless strict} -body {
+    list [matchOnce /users /users/] [matchOnce /users /users/ -strict true]
+} -result {{1 {}} {0 {}}}
+
+test matcher-2.2 {case sensitive by default} -body {
+    list [matchOnce /USERS/:id /users/a] [matchOnce /USERS/:id /users/a -nocase 1]
+} -result {{0 {}} {1 {id a}}}
+
+test matcher-2.3 {start and end flags} -body {
+    list [matchOnce /api x/api/y] [matchOnce /api x/api/y -start false -end false]
+} -result {{0 {}} {1 {}}}
+
+test matcher-2.4 {empty unanchored pattern does not crash} -body {
+    matchOnce {} abc -start 0 -end 0
+} -result {1 {}}
+
+test matcher-2.5 {literal regex characters and escaped colon} -body {
+    matchOnce {/a.b/\:name} /a.b/:name
+} -result {1 {}}
+
+test matcher-2.6 {Unicode bytes survive parameter extraction} -body {
+    matchOnce /κόσμος/:name /κόσμος/你好
+} -result {1 {name 你好}}
+
+test matcher-2.7 {parameters are not URL decoded} -body {
+    matchOnce /:name /a%2Fb
+} -result {1 {name a%2Fb}}
+
+test matcher-2.8 {root and repeated parameter modifiers} -body {
+    list [matchOnce / /] [matchOnce {/:id([0-9])+} /123] [matchOnce {/:id*} /]
+} -result {{1 {}} {1 {id 3}} {1 {}}}
+
+test matcher-3.1 {introspection and command rename cleanup} -body {
+    set m [tpathexp::compile /a/:id]
+    set result [list [$m keys] [$m pattern]]
+    rename $m ::renamedMatcher
+    lappend result [::renamedMatcher match /a/1]
+    ::renamedMatcher destroy
+    lappend result [info commands ::renamedMatcher]
+    set result
+} -result {id {^/a/([^/]+)/?$} 1 {}}
+
+test matcher-3.2 {local and array result variables} -body {
+    proc localMatch {} {
+        set m [tpathexp::compile /:id]
+        $m match /abc array(params)
+        $m destroy
+        return $array(params)
+    }
+    localMatch
+} -cleanup {rename localMatch {}} -result {id abc}
+
+test matcher-3.3 {result variable errors propagate} -body {
+    set m [tpathexp::compile /:id]
+    set scalar x
+    set rc [catch {$m match /x scalar(params)} error]
+    $m destroy
+    list $rc [string match {*variable isn't array*} $error]
+} -result {1 1}
+
+test matcher-3.4 {write trace can delete active matcher} -body {
+    set m [tpathexp::compile /:id]
+    proc removeMatcher {matcher args} { $matcher destroy }
+    trace add variable traced write [list removeMatcher $m]
+    set rc [$m match /x traced]
+    trace remove variable traced write [list removeMatcher $m]
+    list $rc $traced [info commands $m]
+} -cleanup {rename removeMatcher {}} -result {1 {id x} {}}
+
+test matcher-3.5 {interpreter teardown releases live matchers} -body {
+    for {set i 0} {$i < 25} {incr i} {
+        interp create child
+        child eval [list set auto_path $::auto_path]
+        child eval {package require tpathexp; tpathexp::compile /:id}
+        interp delete child
+    }
+    return ok
+} -result ok
+
+test matcher-3.6 {new names do not replace renamed commands} -body {
+    interp create child
+    child eval [list set auto_path $::auto_path]
+    set result [child eval {
+        package require tpathexp
+        set first [tpathexp::compile /first]
+        rename $first ::tpathexp::matcher2
+        set second [tpathexp::compile /second]
+        list [::tpathexp::matcher2 match /first] [$second match /second]
+    }]
+    interp delete child
+    set result
+} -result {1 1}
+
+test matcher-4.1 {malformed patterns raise Tcl errors without leaving commands} -body {
+    set before [info commands ::tpathexp::matcher*]
+    set result {}
+    foreach pattern [list /: /:id( /:id() /:id(?x) {/:id([)} {/:id([z-a])} /:id/:id /{x} "x\\" *] {
+        lappend result [catch {tpathexp::compile $pattern} message options]
+        if {[dict get $options -errorcode] ne {TPATHEXP COMPILE}} { error $options }
+    }
+    list $result [expr {$before eq [info commands ::tpathexp::matcher*]}]
+} -result {{1 1 1 1 1 1 1 1 1 1} 1}
+
+test matcher-4.2 {NUL is rejected in patterns and paths} -body {
+    set m [tpathexp::compile /:id]
+    set result [list [catch {tpathexp::compile "/x\0y"}] [catch {$m match "/x\0y"}]]
+    $m destroy
+    set result
+} -result {1 1}
+
+test matcher-4.3 {invalid arguments and flags} -body {
+    set m [tpathexp::compile /]
+    set result {}
+    foreach command [list {tpathexp::compile} {tpathexp::compile -no 1 /} \
+        {tpathexp::compile -strict bogus /} {tpathexp::compile -strict 1} \
+        [list $m] [list $m keys extra] [list $m match] [list $m unknown]] {
+        lappend result [catch $command]
+    }
+    $m destroy
+    set result
+} -result {1 1 1 1 1 1 1 1}
+
+rename matchOnce {}
+::tcltest::cleanupTests

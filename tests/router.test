@@ -1,0 +1,145 @@
+package require tcltest 2
+package require tpathexp 1.0.0
+namespace import ::tcltest::test
+
+proc echoRoute {label request context params} {
+    tpathexp::response 200 [list $label [dict get $request method] $params $context]
+}
+
+test router-1.1 {first matching method and path wins} -setup {
+    set r [tpathexp::router]
+    $r add POST /users/:id [list echoRoute post]
+    $r add GET /users/me [list echoRoute specific]
+    $r add GET /users/:id [list echoRoute general]
+} -body {
+    list [dict get [$r dispatch {method GET path /users/me}] body] \
+        [dict get [$r dispatch {method POST path /users/me}] body]
+} -cleanup {$r destroy} -result {{specific GET {} {}} {post POST {id me} {}}}
+
+test router-1.2 {HEAD dispatches GET and suppresses body} -setup {
+    set r [tpathexp::router]
+    $r add GET /users/:id [list echoRoute get]
+} -body {
+    set response [$r dispatch {method HEAD path /users/1}]
+    list [dict get $response statusCode] [dict get $response body]
+} -cleanup {$r destroy} -result {200 {}}
+
+test router-1.3 {405 combines Allow across matching routes} -setup {
+    set r [tpathexp::router]
+    $r add GET /users/:id [list echoRoute get]
+    $r add {POST PUT} /users/:id [list echoRoute write]
+    $r add POST /users/:id [list echoRoute duplicate]
+} -body {
+    set response [$r dispatch {method DELETE path /users/1}]
+    list [dict get $response statusCode] [dict get $response headers Allow]
+} -cleanup {$r destroy} -result {405 {GET, HEAD, POST, PUT}}
+
+test router-1.4 {404 and HEAD error bodies} -setup {
+    set r [tpathexp::router]
+    $r add POST /known [list echoRoute post]
+} -body {
+    list [dict get [$r dispatch {method GET path /unknown}] statusCode] \
+        [dict get [$r dispatch {method HEAD path /unknown}] body] \
+        [dict get [$r dispatch {method HEAD path /known}] body]
+} -cleanup {$r destroy} -result {404 {} {}}
+
+test router-1.5 {ANY, route options, and context} -setup {
+    set r [tpathexp::router]
+    $r add ANY /Name/:id [list echoRoute any] -nocase true -strict true
+} -body {
+    list [dict get [$r dispatch {method PATCH path /name/2} {requestId abc}] body] \
+        [dict get [$r match GET /name/2/] statusCode]
+} -cleanup {$r destroy} -result {{any PATCH {id 2} {requestId abc}} 404}
+
+test router-1.6 {invalid routes do not alter the existing table} -setup {
+    set r [tpathexp::router]
+    $r add GET /ok [list echoRoute ok]
+} -body {
+    list [catch {$r add {} /x echoRoute}] [catch {$r add BAD /x echoRoute}] \
+        [catch {$r add GET /x {}}] [catch {$r add GET /: echoRoute}] \
+        [dict get [$r match GET /ok] statusCode]
+} -cleanup {$r destroy} -result {1 1 1 1 200}
+
+test router-1.7 {router teardown releases matchers} -body {
+    set before [lsort [info commands ::tpathexp::matcher*]]
+    set r [tpathexp::router]
+    $r add GET /:one echoRoute
+    $r add POST /:two echoRoute
+    $r destroy
+    expr {$before eq [lsort [info commands ::tpathexp::matcher*]]}
+} -result 1
+
+test router-2.1 {handler errors propagate with their error codes} -setup {
+    proc brokenHandler {args} {return -code error -errorcode {APP FAILED} broken}
+    set r [tpathexp::router]
+    $r add GET / brokenHandler
+} -body {
+    catch {$r dispatch {method GET path /}} message options
+    list $message [dict get $options -errorcode]
+} -cleanup {$r destroy; rename brokenHandler {}} -result {broken {APP FAILED}}
+
+test router-2.2 {response defaults and extensions are preserved} -setup {
+    proc customResponse {args} {dict create statusCode 201 body data cookies {a=b} extra value}
+    set r [tpathexp::router]
+    $r add POST / customResponse
+} -body {
+    set response [$r dispatch {method POST path /}]
+    list [dict get $response statusCode] [dict get $response headers] \
+        [dict get $response isBase64Encoded] [dict get $response cookies] [dict get $response extra]
+} -cleanup {$r destroy; rename customResponse {}} -result {201 {} false a=b value}
+
+test router-2.3 {invalid handler responses raise errors} -setup {
+    proc invalidResponse {value args} {return $value}
+} -body {
+    set result {}
+    foreach value {{body x} {statusCode 200} {statusCode 999 body x} \
+        {statusCode x body x} {statusCode 200 body x headers x} \
+        {statusCode 200 body x isBase64Encoded banana}} {
+        set r [tpathexp::router]
+        $r add GET / [list invalidResponse $value]
+        lappend result [catch {$r dispatch {method GET path /}}]
+        $r destroy
+    }
+    set result
+} -cleanup {rename invalidResponse {}} -result {1 1 1 1 1 1}
+
+test lambda-1.1 {v2 rawPath, method, context and repeated invocations} -setup {
+    set r [tpathexp::router]
+    $r add GET /users/:id [list echoRoute get]
+} -body {
+    set before [info commands ::tpathexp::matcher*]
+    set event {version 2.0 rawPath /users/a%2Fb requestContext {http {method GET path /ignored}}}
+    set response [$r lambda $event {requestId req1}]
+    for {set i 0} {$i < 500} {incr i} { $r lambda $event }
+    list [dict get $response body] [expr {$before eq [info commands ::tpathexp::matcher*]}]
+} -cleanup {$r destroy} -result {{get GET {id a%2Fb} {requestId req1}} 1}
+
+test lambda-1.2 {v1 and REST API event shapes} -setup {
+    set r [tpathexp::router]
+    $r add POST /users/:id [list echoRoute post]
+} -body {
+    list [dict get [$r lambda {version 1.0 httpMethod POST path /users/1}] body] \
+        [dict get [$r lambda {httpMethod POST path /users/2}] body]
+} -cleanup {$r destroy} -result {{post POST {id 1} {}} {post POST {id 2} {}}}
+
+test lambda-1.3 {request fields and original event are preserved} -setup {
+    proc inspectEvent {request context params} {
+        tpathexp::response 200 [list [dict get $request body] [dict get $request isBase64Encoded] \
+            [dict get $request cookies] [dict get $request event custom] [dict get $request pathParameters]]
+    }
+    set r [tpathexp::router]
+    $r add POST /:id inspectEvent
+} -body {
+    dict get [$r lambda {version 2.0 rawPath /x requestContext {http {method POST}} \
+        body YQ== isBase64Encoded true cookies {a=b} custom preserved pathParameters {old value}}] body
+} -cleanup {$r destroy; rename inspectEvent {}} -result {YQ== true a=b preserved {id x}}
+
+test lambda-1.4 {malformed and unsupported events are errors} -setup {
+    set r [tpathexp::router]
+} -body {
+    list [catch {$r lambda {}}] [catch {$r lambda {version 3.0}}] \
+        [catch {$r lambda {version 2.0 rawPath /}}]
+} -cleanup {$r destroy} -result {1 1 1}
+
+rename echoRoute {}
+::tcltest::cleanupTests
