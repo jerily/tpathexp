@@ -1,0 +1,231 @@
+package require tcltest 2
+package require -exact tpathexp 1.2.0
+namespace import ::tcltest::test
+
+namespace eval ::middleware_tests {
+    variable events {}
+    proc enter {name ctx req} {
+        variable events
+        lappend events enter-$name
+        dict lappend req visited $name
+        return $req
+    }
+    proc leave {name ctx req res} {
+        variable events
+        lappend events leave-$name
+        dict lappend res leaves $name
+        return $res
+    }
+    proc handler {req ctx params} {
+        variable events
+        lappend events handler
+        dict create statusCode 200 body [list [dict get $req visited] $ctx $params]
+    }
+    proc abort {ctx req} {
+        return -code error -options {statusCode 401 body denied headers {X-Abort yes}}
+    }
+    proc fail {args} {return -code error -errorcode {APP FAILED} failure}
+    proc echo {value args} {return $value}
+    proc router {} {
+        variable events {}
+        set r [tpathexp::router]
+        $r add_middleware -enter_proc {::middleware_tests::enter one} -leave_proc {::middleware_tests::leave one}
+        $r add_middleware -enter_proc {::middleware_tests::enter two} -leave_proc {::middleware_tests::leave two}
+        return $r
+    }
+}
+
+test middleware-order {router hooks surround route hooks and preserve match API} -setup {
+    set r [::middleware_tests::router]
+    $r add GET /:id ::middleware_tests::handler -strict true \
+        -enter_proc {::middleware_tests::enter route} -leave_proc {::middleware_tests::leave route}
+} -body {
+    set res [$r dispatch {method GET path /42} {requestId abc}]
+    list [dict get $res body] [dict get $res leaves] $::middleware_tests::events \
+        [dict get [$r match GET /42] handler]
+} -cleanup {$r destroy} -result {{{one two route} {requestId abc} {id 42}} {route two one} {enter-one enter-two enter-route handler leave-route leave-two leave-one} ::middleware_tests::handler}
+
+test middleware-after-route {middleware added after route registration also applies} -setup {
+    set r [tpathexp::router]
+    $r add GET / ::middleware_tests::handler
+    $r add_middleware -enter_proc {::middleware_tests::enter later}
+} -body {
+    dict get [$r dispatch {method GET path /}] body
+} -cleanup {$r destroy} -result {later {} {}}
+
+test middleware-enter-abort {only reached leaves run, including the aborting layer} -setup {
+    set r [::middleware_tests::router]
+    $r add_middleware -enter_proc ::middleware_tests::abort -leave_proc {::middleware_tests::leave abort}
+    $r add_middleware -enter_proc ::middleware_tests::fail -leave_proc ::middleware_tests::fail
+    $r add GET / ::middleware_tests::fail -enter_proc ::middleware_tests::fail -leave_proc ::middleware_tests::fail
+} -body {
+    set res [$r dispatch {method GET path /}]
+    list [dict get $res statusCode] [dict get $res body] [dict get $res leaves] $::middleware_tests::events
+} -cleanup {$r destroy} -result {401 denied {abort two one} {enter-one enter-two leave-abort leave-two leave-one}}
+
+test middleware-route-abort {route abort unwinds its leave and router leaves; HEAD is normalized last} -setup {
+    set r [::middleware_tests::router]
+    $r add GET / ::middleware_tests::fail -enter_proc ::middleware_tests::abort -leave_proc {::middleware_tests::leave route}
+} -body {
+    set res [$r dispatch {method HEAD path /}]
+    list [dict get $res statusCode] [dict get $res body] [dict get $res leaves]
+} -cleanup {$r destroy} -result {401 {} {route two one}}
+
+test middleware-handler-abort {handler response errors also unwind hooks} -setup {
+    set r [::middleware_tests::router]
+    $r add GET / {apply {{req ctx params} {::middleware_tests::abort $ctx $req}}} \
+        -leave_proc {::middleware_tests::leave route}
+} -body {
+    set res [$r dispatch {method GET path /}]
+    list [dict get $res statusCode] [dict get $res leaves]
+} -cleanup {$r destroy} -result {401 {route two one}}
+
+foreach stage {router route handler leave} {
+    test middleware-error-$stage {ordinary errors retain return options and stop hooks} -setup {
+        set r [::middleware_tests::router]
+        set handler ::middleware_tests::handler
+        set enter {}
+        set leave {::middleware_tests::leave route}
+        switch $stage {
+            router {$r add_middleware -enter_proc ::middleware_tests::fail -leave_proc ::middleware_tests::fail}
+            route {set enter ::middleware_tests::fail}
+            handler {set handler ::middleware_tests::fail}
+            leave {set leave ::middleware_tests::fail}
+        }
+        $r add GET / $handler -enter_proc $enter -leave_proc $leave
+    } -body {
+        set rc [catch {$r dispatch {method GET path /}} msg options]
+        list $rc $msg [dict get $options -errorcode] \
+            [lsearch -glob $::middleware_tests::events leave-*]
+    } -cleanup {$r destroy} -result {1 failure {APP FAILED} -1}
+}
+
+test middleware-unmatched {router hooks wrap automatic 404/405, route hooks do not} -setup {
+    set r [::middleware_tests::router]
+    $r add POST /known ::middleware_tests::fail -enter_proc ::middleware_tests::fail -leave_proc ::middleware_tests::fail
+} -body {
+    set missing [$r dispatch {method GET path /missing}]
+    set wrong [$r dispatch {method HEAD path /known}]
+    list [dict get $missing statusCode] [dict get $missing leaves] \
+        [dict get $wrong statusCode] [dict get $wrong headers Allow] [dict get $wrong body] [dict get $wrong leaves]
+} -cleanup {$r destroy} -result {404 {two one} 405 POST {} {two one}}
+
+test middleware-prefix {literal prefix arguments and caller-owned values are preserved} -setup {
+    set r [tpathexp::router]
+    set marker {a; [error injected] $variable}
+    set request {method GET path /42}
+    set response {statusCode 200 body original}
+    $r add_middleware -enter_proc [list ::middleware_tests::enter $marker] \
+        -leave_proc [list ::middleware_tests::echo $response]
+    $r add GET /:id ::middleware_tests::handler
+} -body {
+    set actual [$r dispatch $request]
+    list $request $response [dict get $actual body] [dict get $actual headers]
+} -cleanup {$r destroy} -result {{method GET path /42} {statusCode 200 body original} original {}}
+
+test middleware-invalid {bad registrations are atomic and empty hooks are optional} -setup {
+    set r [tpathexp::router]
+} -body {
+    set result {}
+    set bad "\{"
+    foreach command [list [list $r add_middleware] [list $r add_middleware -enter_proc] \
+        [list $r add_middleware -enter_proc {} -leave_proc {}] \
+        [list $r add_middleware -strict true] [list $r add_middleware -unknown unused] \
+        [list $r add_middleware -enter_proc $bad] \
+        [list $r add GET / unused -leave_proc $bad] [list $r add GET / unused -enter_proc]] {
+        lappend result [catch $command]
+    }
+    $r add GET / {::middleware_tests::echo {statusCode 200 body ok}} -enter_proc {} -leave_proc {}
+    lappend result [dict get [$r dispatch {method GET path /}] body]
+} -cleanup {$r destroy} -result {1 1 1 1 1 1 1 1 ok}
+
+test middleware-bad-request {enter must return a dictionary} -setup {
+    set r [tpathexp::router]
+    $r add_middleware -enter_proc {::middleware_tests::echo invalid}
+    $r add GET / ::middleware_tests::fail
+} -body {
+    catch {$r dispatch {method GET path /}} message options
+    dict get $options -errorcode
+} -cleanup {$r destroy} -result {TCL VALUE DICTIONARY}
+
+test middleware-bad-response {leave responses are validated} -setup {
+    set r [tpathexp::router]
+    $r add_middleware -leave_proc {::middleware_tests::echo {statusCode 999 body bad}}
+} -body {
+    catch {$r dispatch {method GET path /}} message options
+    dict get $options -errorcode
+} -cleanup {$r destroy} -result {TPATHEXP RESPONSE}
+
+test middleware-lambda {both Lambda event versions use middleware} -setup {
+    set r [::middleware_tests::router]
+    $r add GET /:id ::middleware_tests::handler -leave_proc {::middleware_tests::leave route}
+} -body {
+    set a [$r lambda {httpMethod GET path /v1} {requestId one}]
+    set b [$r lambda {version 2.0 rawPath /v2 requestContext {http {method GET}}} {requestId two}]
+    list [dict get $a body] [dict get $b body] [dict get $a leaves] [dict get $b leaves]
+} -cleanup {$r destroy} -result {{{one two} {requestId one} {id v1}} {{one two} {requestId two} {id v2}} {route two one} {route two one}}
+
+test middleware-recursion {recursive dispatch and deletion preserve outer leaves and captures} -setup {
+    set r [::middleware_tests::router]
+    proc ::middleware_tests::recurse {r req ctx params} {
+        if {[dict get $params id] eq "outer"} {
+            set inner [$r dispatch {method GET path /inner}]
+            $r destroy
+            return [dict create statusCode 200 body [list [dict get $inner body] $params]]
+        }
+        dict create statusCode 200 body $params
+    }
+    $r add GET /:id [list ::middleware_tests::recurse $r] -leave_proc {::middleware_tests::leave route}
+} -body {
+    set res [$r dispatch {method GET path /outer}]
+    list [dict get $res body] [dict get $res leaves] [info commands $r]
+} -cleanup {rename ::middleware_tests::recurse {}} -result {{{id inner} {id outer}} {route two one} {}}
+
+foreach stage {enter leave} {
+    test middleware-delete-$stage {middleware may delete its router during dispatch} -setup {
+        set r [tpathexp::router]
+        proc ::middleware_tests::delete {r ctx req args} {
+            $r destroy
+            if {[llength $args]} {return [lindex $args 0]}
+            return $req
+        }
+        $r add_middleware -${stage}_proc [list ::middleware_tests::delete $r]
+        $r add GET /:id {::middleware_tests::echo {statusCode 200 body alive}} \
+            -leave_proc {::middleware_tests::leave route}
+    } -body {
+        set res [$r dispatch {method GET path /42}]
+        list [dict get $res body] [dict get $res leaves] [info commands $r]
+    } -cleanup {rename ::middleware_tests::delete {}} -result {alive route {}}
+}
+
+test middleware-mutation {callback registrations affect the next dispatch only} -setup {
+    set r [tpathexp::router]
+    proc ::middleware_tests::register {r ctx req} {
+        $r add_middleware -leave_proc {::middleware_tests::leave new}
+        $r add GET /new {::middleware_tests::echo {statusCode 201 body added}}
+        return $req
+    }
+    $r add_middleware -enter_proc [list ::middleware_tests::register $r]
+    $r add GET / {::middleware_tests::echo {statusCode 200 body ok}} -leave_proc {::middleware_tests::leave route}
+} -body {
+    set first [$r dispatch {method GET path /}]
+    set second [$r dispatch {method GET path /new}]
+    list [dict get $first leaves] [dict get $second statusCode] [dict get $second leaves]
+} -cleanup {$r destroy; rename ::middleware_tests::register {}} -result {route 201 new}
+
+test middleware-teardown {interpreter deletion releases retained command prefixes} -body {
+    for {set i 0} {$i < 25} {incr i} {
+        interp create child
+        child eval [list set auto_path $auto_path]
+        child eval {
+            package require tpathexp 1.2.0
+            set r [tpathexp::router]
+            $r add_middleware -enter_proc {unused literal} -leave_proc unused
+            $r add GET / unused -enter_proc unused -leave_proc unused
+        }
+        interp delete child
+    }
+} -result {}
+
+namespace delete ::middleware_tests
+::tcltest::cleanupTests
