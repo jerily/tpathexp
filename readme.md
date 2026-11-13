@@ -44,7 +44,7 @@ installation. The Makefile also supplies `all`, `test`, `install`, and `clean`
 targets, with `CMAKE`, `BUILD_DIR`, `PREFIX`, and `BUILD_SHARED_LIBS` overrides.
 
 `BUILD_SHARED_LIBS=ON` is the default and builds only the loadable module.
-Installation creates `lib/tpathexp1.1.0/` containing the shared library and package
+Installation creates `lib/tpathexp1.2.0/` containing the shared library and package
 index, plus public headers in `include/tpathexp/`. `CMAKE_INSTALL_LIBDIR` can change
 `lib`. Add the package directory or its parent to Tcl's `auto_path` or `TCLLIBPATH`
 if it is outside the normal search path.
@@ -67,7 +67,7 @@ switching modes, since CMake does not remove files from earlier installations.
 ## Compile once, match many times
 
 ```tcl
-package require tpathexp 1.1.0
+package require tpathexp 1.2.0
 
 set matcher [tpathexp::compile {/users/:id([0-9]+)}]
 if {[$matcher match /users/42 params]} {
@@ -146,7 +146,7 @@ set response [$router dispatch [dict create method GET path /users/42]]
 $router destroy
 ```
 
-`$router add methods expression handler ?compileOptions?` compiles immediately
+`$router add methods expression handler ?options?` compiles immediately
 and returns the router. `methods` is a nonempty list of uppercase HTTP methods,
 or `ANY` for GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE, and CONNECT.
 Register specific routes before broader routes: the first matching path and
@@ -172,11 +172,54 @@ Handlers construct ordinary dictionaries. The Lambda example defines its own
 `::example::response` helper; response construction is not a package command.
 Dispatch generates text 404/405 responses, includes `Allow` on 405, and empties
 all HEAD response bodies. Application errors propagate as Tcl errors, retaining
-their error codes. Use Tcl command prefixes to compose authentication, logging,
-or other application middleware around handlers.
+their error codes.
 
 Destroying the router releases its matchers. Build the route table during
 initialization and retain it across requests; dispatch does not recompile routes.
+
+## Middleware
+
+Router and route hooks run in the native C dispatch command (including `lambda`):
+
+```tcl
+proc enterA {context request} {
+    dict set request authenticated true
+    return $request
+}
+proc leaveA {context request response} {
+    dict set response headers X-Processed true
+    return $response
+}
+$router add_middleware -enter_proc enterA -leave_proc leaveA
+$router add GET /users/:id get_user -enter_proc check_user -leave_proc log_user
+```
+
+`$router add_middleware ?-enter_proc prefix? ?-leave_proc prefix?` appends a layer
+and returns the router; at least one nonempty hook is required. `$router add`
+also accepts `-enter_proc` and `-leave_proc`, alongside the compile options.
+Each hook is a Tcl command prefix; an empty list disables it. Use fully qualified
+names for namespace commands. Enter hooks receive `context request` and return
+an updated request dictionary. Leave hooks receive `context request response`
+and return an updated response dictionary. Handlers still receive
+`request context params`.
+
+Matching happens first, so enter hooks see `pathParameters`; changing the request
+does not select a different route. Router enter hooks run in registration order,
+then the route enter hook and handler. The route leave hook runs first, followed
+by router leave hooks in reverse order. Router hooks also wrap automatic 404/405
+responses; route hooks only run for a matched method and path. Middleware added
+after routes applies to those routes too.
+
+An enter hook or handler can stop processing with
+`return -code error -options [dict create statusCode 403 body Forbidden]`.
+This skips later enter hooks and the handler, then runs leaves for reached
+layers, including the layer that stopped processing. Ordinary Tcl errors skip
+leaves and preserve their return options. A failing leave stops remaining leaves.
+Response validation and HEAD body suppression happen after all successful leaves.
+
+Each dispatch retains its selected handler and hooks. Callbacks may recursively
+dispatch or destroy the router safely; new registrations affect subsequent
+dispatches. Deleting the router or its interpreter releases the stored prefixes.
 
 ## AWS Lambda
 
@@ -219,7 +262,7 @@ artifact or layer, and put that directory on `auto_path`. For example:
 cmake --install build --prefix "$PWD/stage"
 ```
 
-Include `stage/lib/tpathexp1.1.0` (or the configured library directory) in the
+Include `stage/lib/tpathexp1.2.0` (or the configured library directory) in the
 artifact. Configure the runtime's actual Tcl package path to that location.
 The loadable module uses Tcl stubs and needs no direct `libtcl` dependency.
 
@@ -228,7 +271,7 @@ link `libtpathexp.a` plus Tcl and any system libraries required by that Tcl buil
 Register the package once with
 `Tcl_StaticPackage(NULL, "Tpathexp", Tpathexp_Init, NULL)`, then initialize each
 interpreter with `Tcl_Init`. With the installed package index on `auto_path`,
-`package require tpathexp 1.1.0` loads the registered package, including in child
+`package require tpathexp 1.2.0` loads the registered package, including in child
 interpreters. Alternatively, call `Tpathexp_Init(interp)` directly in each
 initialized interpreter. No Tcl implementation file needs to be sourced.
 See [tests/embed.c](tests/embed.c) for a working embedding example. Cross builds

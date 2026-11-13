@@ -1,12 +1,15 @@
 #include "tpathexpInt.h"
 #include "router.h"
 
+#include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 typedef struct {
     tpathexp_router_t *table;
     Tcl_Obj *handlers;
+    Tcl_Obj *middleware;
     Tcl_Command token;
 } router_command_t;
 
@@ -49,6 +52,63 @@ static int match_route(router_command_t *router, Tcl_Interp *interp,
     return TCL_OK;
 }
 
+/* Hooks are command prefixes, just like handlers. Empty hooks are disabled. */
+static int hook_options(Tcl_Interp *interp, int first, int objc,
+                        Tcl_Obj *const objv[], Tcl_Obj **enter, Tcl_Obj **leave,
+                        int *flags) {
+    static const char *const options[] = {
+        "-enter_proc", "-leave_proc", "-strict", "-start", "-end", "-nocase", NULL
+    };
+    static const int bits[] = {PATH_REGEXP_STRICT, PATH_REGEXP_START,
+                               PATH_REGEXP_END, PATH_REGEXP_NOCASE};
+    *enter = *leave = NULL;
+    if (flags != NULL) *flags = TPATHEXP_DEFAULT_FLAGS;
+    if (objc > first && strcmp(Tcl_GetString(objv[objc - 1]), "--") == 0) --objc;
+    if ((objc - first) % 2 != 0) return Tpathexp_Error(interp, "OPTIONS", "options require values");
+    for (int i = first; i < objc; i += 2) {
+        int option;
+        if (Tcl_GetIndexFromObj(interp, objv[i], options, "option", TCL_EXACT, &option) != TCL_OK) return TCL_ERROR;
+        if (option < 2) {
+            Tcl_Size count;
+            if (Tcl_ListObjLength(interp, objv[i + 1], &count) != TCL_OK) return TCL_ERROR;
+            *(option == 0 ? enter : leave) = count == 0 ? NULL : objv[i + 1];
+        } else {
+            int enabled;
+            if (flags == NULL) return Tpathexp_Error(interp, "OPTIONS", "expected -enter_proc or -leave_proc");
+            if (Tcl_GetBooleanFromObj(interp, objv[i + 1], &enabled) != TCL_OK) return TCL_ERROR;
+            if (enabled) *flags |= bits[option - 2];
+            else *flags &= ~bits[option - 2];
+        }
+    }
+    return TCL_OK;
+}
+
+static void router_result(router_command_t *router, Tcl_Interp *interp) {
+    Tcl_Obj *name = Tcl_NewObj();
+    Tcl_GetCommandFullName(interp, router->token, name);
+    Tcl_SetObjResult(interp, name);
+}
+
+static int add_middleware(router_command_t *router, Tcl_Interp *interp,
+                          int objc, Tcl_Obj *const objv[]) {
+    Tcl_Obj *enter, *leave;
+    if (hook_options(interp, 2, objc, objv, &enter, &leave, NULL) != TCL_OK) return TCL_ERROR;
+    if (enter == NULL && leave == NULL) {
+        return Tpathexp_Error(interp, "MIDDLEWARE", "at least one enter or leave proc is required");
+    }
+    /* In-flight dispatches retain their original middleware list. */
+    if (Tcl_IsShared(router->middleware)) {
+        Tcl_Obj *copy = Tcl_DuplicateObj(router->middleware);
+        Tcl_IncrRefCount(copy);
+        Tcl_DecrRefCount(router->middleware);
+        router->middleware = copy;
+    }
+    Tcl_Obj *hooks[] = {enter ? enter : Tcl_NewObj(), leave ? leave : Tcl_NewObj()};
+    Tcl_ListObjAppendElement(interp, router->middleware, Tcl_NewListObj(2, hooks));
+    router_result(router, interp);
+    return TCL_OK;
+}
+
 static int add_route(router_command_t *router, Tcl_Interp *interp,
                      int objc, Tcl_Obj *const objv[]) {
     Tcl_Size count;
@@ -70,18 +130,22 @@ static int add_route(router_command_t *router, Tcl_Interp *interp,
     if (Tcl_ListObjLength(interp, objv[4], &count) != TCL_OK) return TCL_ERROR;
     if (count == 0) return Tpathexp_Error(interp, "HANDLER", "handler must be a nonempty command prefix");
     int flags;
-    if (Tpathexp_Flags(interp, 5, objc, objv, &flags) != TCL_OK) return TCL_ERROR;
+    Tcl_Obj *enter, *leave;
+    if (hook_options(interp, 5, objc, objv, &enter, &leave, &flags) != TCL_OK) return TCL_ERROR;
     const char *expression = Tpathexp_Text(interp, objv[3]);
     if (expression == NULL) return TCL_ERROR;
-    tpathexp_route_t route = {expression, mask, flags, objv[4]};
+    Tcl_Obj *items[] = {objv[4], enter ? enter : Tcl_NewObj(), leave ? leave : Tcl_NewObj()};
+    Tcl_Obj *entry = Tcl_NewListObj(3, items);
+    Tcl_IncrRefCount(entry);
+    tpathexp_route_t route = {expression, mask, flags, entry};
     char error[512] = {0};
     if (tpathexp_router_add(router->table, &route, error, sizeof(error)) != 0) {
+        Tcl_DecrRefCount(entry);
         return Tpathexp_Error(interp, "COMPILE", error);
     }
-    Tcl_ListObjAppendElement(interp, router->handlers, objv[4]);
-    Tcl_Obj *name = Tcl_NewObj();
-    Tcl_GetCommandFullName(interp, router->token, name);
-    Tcl_SetObjResult(interp, name);
+    Tcl_ListObjAppendElement(interp, router->handlers, entry);
+    Tcl_DecrRefCount(entry);
+    router_result(router, interp);
     return TCL_OK;
 }
 
@@ -92,7 +156,9 @@ static int match_command(router_command_t *router, Tcl_Interp *interp,
     Tcl_Obj *result = Tcl_NewDictObj();
     dict_put(result, "statusCode", Tcl_NewIntObj(match.status_code));
     if (match.status_code == 200) {
-        dict_put(result, "handler", match.user_data);
+        Tcl_Obj *handler;
+        Tcl_ListObjIndex(interp, match.user_data, 0, &handler);
+        dict_put(result, "handler", handler);
         dict_put(result, "expression", Tcl_NewStringObj(match.expression, -1));
         dict_put(result, "pathParameters", params_dict(&match));
     } else if (match.status_code == 405) {
@@ -126,6 +192,45 @@ static int normalize_response(Tcl_Interp *interp, Tcl_Obj *response, int head) {
     return TCL_OK;
 }
 
+/* Own the argument list across callbacks, including recursive dispatch. */
+static int invoke_prefix(Tcl_Interp *interp, Tcl_Obj *prefix, int extra_count,
+                         Tcl_Obj *const extra[]) {
+    Tcl_Obj *command = Tcl_DuplicateObj(prefix);
+    Tcl_IncrRefCount(command);
+    for (int i = 0; i < extra_count; ++i) Tcl_ListObjAppendElement(interp, command, extra[i]);
+    Tcl_Size count;
+    Tcl_Obj **args;
+    int rc = Tcl_ListObjGetElements(interp, command, &count, &args);
+    if (rc == TCL_OK && count > INT_MAX) {
+        rc = Tpathexp_Error(interp, "ARGS", "too many callback arguments");
+    }
+    if (rc == TCL_OK) rc = Tcl_EvalObjv(interp, (int) count, args, TCL_EVAL_GLOBAL);
+    Tcl_DecrRefCount(command);
+    return rc;
+}
+
+static void replace_result(Tcl_Interp *interp, Tcl_Obj **value) {
+    Tcl_Obj *next = Tcl_GetObjResult(interp);
+    Tcl_IncrRefCount(next);
+    if (*value != NULL) Tcl_DecrRefCount(*value);
+    *value = next;
+}
+
+static int enter_layer(Tcl_Interp *interp, Tcl_Obj *enter, Tcl_Obj *leave,
+                       Tcl_Obj *context, Tcl_Obj **request, Tcl_Obj *leaves) {
+    /* This layer's leave also runs if its enter returns an HTTP response. */
+    if (Tcl_GetCharLength(leave) != 0) Tcl_ListObjAppendElement(interp, leaves, leave);
+    if (Tcl_GetCharLength(enter) == 0) return TCL_OK;
+    Tcl_Obj *args[] = {context, *request};
+    int rc = invoke_prefix(interp, enter, 2, args);
+    if (rc == TCL_OK) {
+        Tcl_Size size;
+        rc = Tcl_DictObjSize(interp, Tcl_GetObjResult(interp), &size);
+        if (rc == TCL_OK) replace_result(interp, request);
+    }
+    return rc;
+}
+
 static int dispatch(router_command_t *router, Tcl_Interp *interp,
                     Tcl_Obj *request, Tcl_Obj *context) {
     Tcl_Obj *method, *path;
@@ -134,24 +239,24 @@ static int dispatch(router_command_t *router, Tcl_Interp *interp,
     int head = strcmp(Tcl_GetString(method), "HEAD") == 0;
     tpathexp_match_t match = {0};
     if (match_route(router, interp, method, path, &match) != TCL_OK) return TCL_ERROR;
-    Tcl_Obj *response;
-    if (match.status_code == 200) {
-        Tcl_Obj *params = params_dict(&match);
-        Tcl_Obj *handler_request = Tcl_DuplicateObj(request);
-        Tcl_Obj *command = Tcl_DuplicateObj(match.user_data);
-        Tcl_IncrRefCount(command);
-        dict_put(handler_request, "pathParameters", params);
-        Tcl_ListObjAppendElement(interp, command, handler_request);
-        Tcl_ListObjAppendElement(interp, command, context);
-        Tcl_ListObjAppendElement(interp, command, params);
-        tpathexp_match_destroy(&match);
-        /* Handlers may delete this router or recursively dispatch requests. */
-        int rc = Tcl_EvalObjEx(interp, command, TCL_EVAL_GLOBAL | TCL_EVAL_DIRECT);
-        Tcl_DecrRefCount(command);
-        if (rc != TCL_OK) return rc;
-        response = Tcl_DuplicateObj(Tcl_GetObjResult(interp));
-    } else {
+
+    /* Snapshot all borrowed route data before invoking user code. Callbacks may
+     * add routes/middleware, rename or destroy the router, or dispatch again. */
+    Tcl_Obj *entry = match.status_code == 200 ? match.user_data : NULL;
+    Tcl_Obj *middleware = router->middleware;
+    Tcl_Obj *req = Tcl_DuplicateObj(request);
+    Tcl_Obj *params = params_dict(&match);
+    Tcl_Obj *leaves = Tcl_NewListObj(0, NULL);
+    Tcl_Obj *response = NULL;
+    if (entry != NULL) Tcl_IncrRefCount(entry);
+    Tcl_IncrRefCount(middleware);
+    Tcl_IncrRefCount(req);
+    Tcl_IncrRefCount(params);
+    Tcl_IncrRefCount(leaves);
+    dict_put(req, "pathParameters", params);
+    if (entry == NULL) {
         response = Tcl_NewDictObj();
+        Tcl_IncrRefCount(response);
         Tcl_Obj *headers = Tcl_NewDictObj();
         dict_put(headers, "content-type", Tcl_NewStringObj("text/plain; charset=utf-8", -1));
         if (match.status_code == 405) {
@@ -162,11 +267,74 @@ static int dispatch(router_command_t *router, Tcl_Interp *interp,
         dict_put(response, "statusCode", Tcl_NewIntObj(match.status_code));
         dict_put(response, "headers", headers);
         dict_put(response, "body", Tcl_NewStringObj(match.status_code == 404 ? "not found\n" : "method not allowed\n", -1));
-        tpathexp_match_destroy(&match);
     }
-    Tcl_IncrRefCount(response);
-    int rc = normalize_response(interp, response, head);
-    Tcl_DecrRefCount(response);
+    tpathexp_match_destroy(&match);
+
+    Tcl_Size count;
+    Tcl_ListObjLength(interp, middleware, &count);
+    int rc = TCL_OK;
+    for (Tcl_Size i = 0; i < count; ++i) {
+        Tcl_Obj *layer, *enter, *leave;
+        Tcl_ListObjIndex(interp, middleware, i, &layer);
+        Tcl_ListObjIndex(interp, layer, 0, &enter);
+        Tcl_ListObjIndex(interp, layer, 1, &leave);
+        rc = enter_layer(interp, enter, leave, context, &req, leaves);
+        if (rc != TCL_OK) goto failed;
+    }
+    if (entry != NULL) {
+        Tcl_Obj *handler, *enter, *leave;
+        Tcl_ListObjIndex(interp, entry, 0, &handler);
+        Tcl_ListObjIndex(interp, entry, 1, &enter);
+        Tcl_ListObjIndex(interp, entry, 2, &leave);
+        rc = enter_layer(interp, enter, leave, context, &req, leaves);
+        if (rc != TCL_OK) goto failed;
+        Tcl_Obj *args[] = {req, context, params};
+        rc = invoke_prefix(interp, handler, 3, args);
+        if (rc != TCL_OK) goto failed;
+        replace_result(interp, &response);
+    }
+    goto leave;
+
+failed:
+    if (rc == TCL_ERROR) {
+        Tcl_Obj *options = Tcl_GetReturnOptions(interp, rc);
+        Tcl_Obj *status, *body;
+        Tcl_IncrRefCount(options);
+        if (dict_get(interp, options, "statusCode", 0, &status) == TCL_OK &&
+            dict_get(interp, options, "body", 0, &body) == TCL_OK &&
+            status != NULL && body != NULL) {
+            if (response != NULL) Tcl_DecrRefCount(response);
+            response = options;
+            Tcl_ResetResult(interp);
+            goto leave;
+        }
+        Tcl_DecrRefCount(options);
+    }
+    goto done;
+
+leave:
+    Tcl_ListObjLength(interp, leaves, &count);
+    for (Tcl_Size i = count; i > 0; --i) {
+        Tcl_Obj *hook;
+        Tcl_ListObjIndex(interp, leaves, i - 1, &hook);
+        Tcl_Obj *args[] = {context, req, response};
+        rc = invoke_prefix(interp, hook, 3, args);
+        if (rc != TCL_OK) goto done;
+        replace_result(interp, &response);
+    }
+    /* Normalize a private copy, preserving responses shared by callbacks. */
+    Tcl_Obj *copy = Tcl_DuplicateObj(response);
+    Tcl_IncrRefCount(copy);
+    rc = normalize_response(interp, copy, head);
+    Tcl_DecrRefCount(copy);
+
+done:
+    if (response != NULL) Tcl_DecrRefCount(response);
+    Tcl_DecrRefCount(leaves);
+    Tcl_DecrRefCount(params);
+    Tcl_DecrRefCount(req);
+    Tcl_DecrRefCount(middleware);
+    if (entry != NULL) Tcl_DecrRefCount(entry);
     return rc;
 }
 
@@ -209,17 +377,18 @@ static void delete_router(ClientData data) {
     router_command_t *router = data;
     tpathexp_router_destroy(router->table);
     Tcl_DecrRefCount(router->handlers);
+    Tcl_DecrRefCount(router->middleware);
     free(router);
 }
 
 static int router_command(ClientData data, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
-    static const char *const commands[] = {"add", "match", "dispatch", "lambda", "destroy", NULL};
+    static const char *const commands[] = {"add", "match", "dispatch", "lambda", "destroy", "add_middleware", NULL};
     static const char *const arguments[] = {
-        "methods expression handler ?options?", "method path", "request ?context?", "event ?context?", ""
+        "methods expression handler ?options?", "method path", "request ?context?", "event ?context?", "", "?-enter_proc prefix? ?-leave_proc prefix?"
     };
     int index;
     if (objc < 2) {
-        Tcl_WrongNumArgs(interp, 1, objv, "add|match|dispatch|lambda|destroy ?args?");
+        Tcl_WrongNumArgs(interp, 1, objv, "add|match|dispatch|lambda|destroy|add_middleware ?args?");
         return TCL_ERROR;
     }
     if (Tcl_GetIndexFromObj(interp, objv[1], commands, "subcommand", TCL_EXACT, &index) != TCL_OK) return TCL_ERROR;
@@ -229,6 +398,7 @@ static int router_command(ClientData data, Tcl_Interp *interp, int objc, Tcl_Obj
         return TCL_ERROR;
     }
     router_command_t *router = data;
+    if (index == 5) return add_middleware(router, interp, objc, objv);
     if (index == 0) return add_route(router, interp, objc, objv);
     if (index == 1) return match_command(router, interp, objv[2], objv[3]);
     if (index == 4) {
@@ -256,10 +426,14 @@ static int create_router(ClientData data, Tcl_Interp *interp, int objc, Tcl_Obj 
     }
     router->handlers = Tcl_NewListObj(0, NULL);
     Tcl_IncrRefCount(router->handlers);
+    router->middleware = Tcl_NewListObj(0, NULL);
+    Tcl_IncrRefCount(router->middleware);
     unsigned long long *next_id = data;
     Tcl_Obj *name;
+    char buffer[80];
     do {
-        name = Tcl_ObjPrintf("::tpathexp::router%llu", ++*next_id);
+        snprintf(buffer, sizeof(buffer), "::tpathexp::router%llu", ++*next_id);
+        name = Tcl_NewStringObj(buffer, -1);
         Tcl_IncrRefCount(name);
         if (Tcl_FindCommand(interp, Tcl_GetString(name), NULL, TCL_GLOBAL_ONLY) == NULL) break;
         Tcl_DecrRefCount(name);
